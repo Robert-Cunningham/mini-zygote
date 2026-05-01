@@ -10,7 +10,7 @@ function gradient_4(f, args...)
     (block_map, return_map) = statements_to_surrounding_block(f, args...)
     executed_blocks = trace_executed_blocks(f, args...)
 
-    # remote unused blocks, so they don't clutter up the function suffix process.
+    # remove unused blocks, so they don't clutter up the function suffix process.
     for i in length(ir.blocks):-1:0
         if i in executed_blocks
             break
@@ -29,8 +29,6 @@ function gradient_4(f, args...)
         end
     end
 
-    println(block_map, executed_blocks, return_map)
-    
 	# this version works only for a single block
     #block = IRTools.blocks(ir)[length(ir.blocks)]
     
@@ -38,7 +36,7 @@ function gradient_4(f, args...)
     #return_var = IRTools.returnvalue(block)
 
     last_block = executed_blocks[length(executed_blocks)]
-    return_var = var(return_map[last_block])
+    return_var = return_map[last_block]
 
     arg_count = ir.meta.nargs
     
@@ -46,13 +44,12 @@ function gradient_4(f, args...)
     # x_to_gx keeps track of the most recent acucmulation for some variable x.
     x_to_gx = Dict()
     
-    one = IRTools.insertafter!(ir, return_var, :(1))
+    one = return_var isa IRTools.Inner.Variable ? IRTools.insertafter!(ir, return_var, :(1)) : IRTools.push!(ir, :(1))
 
     x_to_gx[return_var] = one
     
     for assignee in len:-1:(arg_count+1)
         if !(block_map[assignee] in executed_blocks)
-            println("skipped ", assignee)
             continue
         end
         if !(var(assignee) in keys(ir))
@@ -66,7 +63,7 @@ function gradient_4(f, args...)
             g_assignee = x_to_gx[var(assignee)]
             for (i, a) in Iterators.enumerate(ex.args[2:length(ex.args)])
                 g_old = get(x_to_gx, a, IRTools.push!(ir, :(0)))
-				factor = derivative_rule(eval(ex.args[1]), ex.args[2: length(ex.args)], i)
+				factor = derivative_rule(eval(ex.args[1]), ex.args[1], ex.args[2: length(ex.args)], i)
                 g_new = IRTools.push!(ir, :($(g_old) + $(g_assignee) * $(factor)))
                 
                 x_to_gx[a] = g_new
@@ -76,7 +73,7 @@ function gradient_4(f, args...)
 
     null = IRTools.push!(ir, :(nothing))
     
-    outs = [return_var]
+    outs = Any[return_var]
     
     for o in 2:arg_count
         g_arg = get(x_to_gx, var(o), null)
@@ -89,8 +86,6 @@ function gradient_4(f, args...)
     ir[out_var] = IRTools.Inner.Statement(:($(GlobalRef(Core, :tuple))($(outs...),)))
     
     IRTools.return!(ir, out_var)
-
-    println(ir)
 
     #return ir
 
@@ -106,20 +101,29 @@ end
 # end
 
 # derivative_rule returns the derivative rule wrt the argument at position i.
-function derivative_rule(::typeof(sin), args, i)
+function derivative_rule(::typeof(sin), callee, args, i)
     return :(cos($(args[1])))
 end
 
-function derivative_rule(::typeof(+), args, i)
+function derivative_rule(::typeof(+), callee, args, i)
     return 1
 end
 
-function derivative_rule(::typeof(*), args, i)
+function derivative_rule(::typeof(*), callee, args, i)
     if i == 1
         return args[2]
     elseif i == 2
         return args[1]
     end
+end
+
+function derivative_rule(unknown_function, callee, args, i)
+    return :($(GlobalRef(@__MODULE__, :runtime_derivative_rule))($(callee), $(i), $(args...)))
+end
+
+function runtime_derivative_rule(f, i, args...)
+    g = gradient_4(f, args...)[i]
+    return g === nothing ? 0 : g
 end
 
 function statements_to_surrounding_block(f, args...)
@@ -128,16 +132,13 @@ function statements_to_surrounding_block(f, args...)
     block_map = Dict()
     return_map = Dict()
 
-    current_block = 0
-    for l in split(string(ir), '\n')
-        if occursin(r"^\d*:", l)
-            current_block = parse(Int64, strip(split(l, ":")[1]))
-        elseif occursin(r"=", l)
-            v = parse(Int64, match(r"%(\d*) =", l)[1])
-            block_map[v] = current_block
-        elseif occursin(r"return", l)
-            v = parse(Int64, match(r"return %(\d*)", l)[1])
-            return_map[current_block] = v
+    for i in 1:length(ir.defs)
+        block_map[i] = ir.defs[i][1]
+    end
+
+    for block in IRTools.blocks(ir)
+        if IRTools.isreturn(IRTools.branches(block)[end])
+            return_map[block.id] = IRTools.returnvalue(block)
         end
     end
     
@@ -149,12 +150,11 @@ function trace_executed_blocks(f, args...)
     gradient_trace = []
     
     ir = IRTools.@code_ir f(args...)
-    for m in eachmatch(r"(\d.*):.*\n  %(\d*)", string(ir)) #we're using regex here because the IRTools API somehow doesn't expose the thing we want.
-        block_index, var_index = parse(Int64, m[1]), parse(Int64, m[2])
-        IRTools.insert!(ir, IRTools.var(var_index), :(push!($(GlobalRef(Main, :gradient_trace)), $(block_index))))
+    for block in IRTools.blocks(ir)
+        pushfirst!(block, :($(GlobalRef(Base, :push!))($(GlobalRef(@__MODULE__, :gradient_trace)), $(block.id))))
     end
 
     Base.invokelatest(IRTools.func(ir), nothing, args...)
     
-    return gradient_trace
+    return unique(gradient_trace)
 end
